@@ -1,5 +1,7 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_atari_envpool_xla_jaxpy
 import os
+
+from RunningMeanStd import RunningMeanStd
 os.environ['JAX_DEFAULT_DTYPE_BITS'] = '32'
 from flax.training.train_state import TrainState
 from flax.linen.initializers import constant, orthogonal
@@ -142,38 +144,6 @@ class EpisodeStatistics:
     returned_episode_returns: jnp.array
     returned_episode_lengths: jnp.array
 
-@flax.struct.dataclass
-class RunningMeanStd:
-    eps: jnp.array =jnp.array(np.finfo(np.float64).eps.item(),dtype=jnp.float64)
-    mean: jnp.array =0.0
-    var: jnp.array =1.0
-    clip_max: jnp.array =jnp.array(10.0,dtype=jnp.float64)
-    count: jnp.array =jnp.array(0,dtype=jnp.int64)
-
-def norm_rms(rms:RunningMeanStd, data_array):
-    data_array = (data_array - rms.mean) / jnp.sqrt(rms.var + rms.eps)
-    data_array = jnp.clip(data_array, -rms.clip_max, rms.clip_max)
-    return data_array
-
-def update_rms(rms:RunningMeanStd, data_array: jnp.ndarray) -> None:
-    """Add a batch of item into RMS with the same shape, modify mean/var/count."""
-    batch_mean, batch_var = jnp.mean(data_array, axis=0), jnp.var(data_array, axis=0)
-    batch_count = len(data_array)
-
-    delta = batch_mean - rms.mean
-    total_count = rms.count + batch_count
-
-    new_mean = rms.mean + delta * batch_count / total_count
-    m_a = rms.var * rms.count
-    m_b = batch_var * batch_count
-    m_2 = m_a + m_b + delta**2 * rms.count * batch_count / total_count
-    new_var = m_2 / total_count
-    return rms.replace(
-        mean=new_mean,
-        var=new_var,
-        count=total_count
-    )
-
 
 if __name__ == "__main__":
     args = parse_args()
@@ -221,8 +191,8 @@ if __name__ == "__main__":
     def norm_env_wrappeed(handle,obs_rms, action_remap):
         handle, (next_obs, reward, next_done,next_truncated, info) = step_env(
             handle, action_remap)
-        obs_rms=update_rms(obs_rms,next_obs)
-        return handle,obs_rms, (norm_rms(obs_rms,next_obs), reward, next_done,next_truncated, info) 
+        obs_rms=obs_rms.update(next_obs)
+        return handle,obs_rms, (obs_rms.norm(next_obs), reward, next_done,next_truncated, info) 
 
     def step_env_wrappeed(episode_stats, handle, obs_rms, action):
         action_remap=np.clip(action, -1.0, 1.0)
@@ -425,8 +395,8 @@ if __name__ == "__main__":
     start_time = time.time()
     obs_rms=RunningMeanStd()
     next_obs,info = envs.reset()
-    obs_rms=update_rms(obs_rms,next_obs)
-    next_obs=norm_rms(obs_rms,next_obs).astype(jnp.float32)
+    obs_rms=obs_rms.update(next_obs)
+    next_obs=obs_rms.norm(next_obs).astype(jnp.float32)
     next_done = jnp.zeros(args.num_envs, dtype=jax.numpy.bool_)
     next_truncated = jnp.zeros(args.num_envs, dtype=jax.numpy.bool_)
     # based on https://github.dev/google/evojax/blob/0625d875262011d8e1b6aa32566b236f44b4da66/evojax/sim_mgr.py
@@ -466,25 +436,14 @@ if __name__ == "__main__":
             agent_state, episode_stats, next_obs, next_done, next_truncated, key, handle,obs_rms
         )
         global_step += args.num_steps * args.num_envs
-        if False:#jnp.any(storage.truncated):
-            with jax.disable_jit():
-                agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
-                    agent_state,
-                    next_obs,
-                    next_done,
-                    next_truncated,
-                    storage,
-                    key,
-                )
-        else:
-            agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
-                agent_state,
-                next_obs,
-                next_done,
-                next_truncated,
-                storage,
-                key,
-            )
+        agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
+            agent_state,
+            next_obs,
+            next_done,
+            next_truncated,
+            storage,
+            key,
+        )
         print(
             f"pg_loss={pg_loss.mean()}, loss={loss.mean()}, v_loss={v_loss.mean()}, entropy_loss={entropy_loss.mean()}")
         avg_episodic_return = np.mean(jax.device_get(
