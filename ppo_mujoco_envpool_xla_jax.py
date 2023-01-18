@@ -2,6 +2,7 @@
 import os
 
 from RunningMeanStd import RunningMeanStd
+from venv_wrappers import VectorEnvClipAct, VectorEnvNormObs, VectorEnvWrapper
 os.environ['JAX_DEFAULT_DTYPE_BITS'] = '32'
 from flax.training.train_state import TrainState
 from flax.linen.initializers import constant, orthogonal
@@ -174,9 +175,9 @@ if __name__ == "__main__":
         num_envs=args.num_envs,
         seed=args.seed,
     )
-    envs.num_envs = args.num_envs
-    envs.single_action_space = envs.action_space
-    envs.single_observation_space = envs.observation_space
+    num_envs = args.num_envs
+    single_action_space = envs.action_space
+    single_observation_space = envs.observation_space
     envs.is_vector_env = True
     episode_stats = EpisodeStatistics(
         episode_returns=jnp.zeros(args.num_envs, dtype=jnp.float32),
@@ -184,21 +185,16 @@ if __name__ == "__main__":
         returned_episode_returns=jnp.zeros(args.num_envs, dtype=jnp.float32),
         returned_episode_lengths=jnp.zeros(args.num_envs, dtype=jnp.int32),
     )
-    handle, recv, send, step_env = envs.xla()
+    wrappers=[VectorEnvNormObs(),VectorEnvClipAct(envs.action_space.low,envs.action_space.high)]
+    envs=VectorEnvWrapper(envs,wrappers)
     
-    action_high=envs.action_space.high
-    action_low=envs.action_space.low
-    def norm_env_wrappeed(handle,obs_rms, action_remap):
-        handle, (next_obs, reward, next_done,next_truncated, info) = step_env(
-            handle, action_remap)
-        obs_rms=obs_rms.update(next_obs)
-        return handle,obs_rms, (obs_rms.norm(next_obs), reward, next_done,next_truncated, info) 
+    handle, recv, send, step_env = envs.xla()
 
-    def step_env_wrappeed(episode_stats, handle, obs_rms, action):
-        action_remap=np.clip(action, -1.0, 1.0)
-        action_remap=(action_low+(action_remap+1.0)*(action_high-action_low)/2.0).astype(np.float64)
-        handle,obs_rms, (next_obs, reward, next_done,next_truncated, info) = norm_env_wrappeed(
-            handle,obs_rms, action_remap)
+    def step_env_wrappeed(episode_stats, handle, action):
+        # action_remap=np.clip(action, -1.0, 1.0)
+        # action_remap=(action_low+(action_remap+1.0)*(action_high-action_low)/2.0).astype(np.float64)
+        handle, (next_obs, reward, next_done,next_truncated, info) = step_env(
+            handle, action)
         new_episode_return = episode_stats.episode_returns + reward
         new_episode_length = episode_stats.episode_lengths + 1
         episode_stats = episode_stats.replace(
@@ -212,7 +208,7 @@ if __name__ == "__main__":
                 next_done+next_truncated, new_episode_length, episode_stats.returned_episode_lengths
             ),
         )
-        return episode_stats, handle, obs_rms, (next_obs, reward, next_done,next_truncated, info)
+        return episode_stats, handle, (next_obs, reward, next_done,next_truncated, info)
 
     def linear_schedule(count):
         # anneal learning rate linearly after one training iteration which contains
@@ -222,16 +218,16 @@ if __name__ == "__main__":
         return args.learning_rate * frac
 
     actor = Actor(
-        action_dim=np.prod(envs.single_action_space.shape),
+        action_dim=np.prod(single_action_space.shape),
     )
     critic = Critic()
     agent_state = TrainState.create(
         apply_fn=None,
         params=AgentParams(
             actor.init(actor_key, np.array(
-                [envs.single_observation_space.sample()], dtype=jnp.float32)),
+                [single_observation_space.sample()], dtype=jnp.float32)),
             critic.init(critic_key, np.array(
-                [envs.single_observation_space.sample()], dtype=jnp.float32)),
+                [single_observation_space.sample()], dtype=jnp.float32)),
         ),
         tx=optax.chain(
             optax.clip_by_global_norm(args.max_grad_norm),
@@ -393,19 +389,17 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
-    obs_rms=RunningMeanStd()
-    next_obs,info = envs.reset()
-    obs_rms=obs_rms.update(next_obs)
-    next_obs=obs_rms.norm(next_obs).astype(jnp.float32)
+    handle,(next_obs,info) = envs.reset()
+    next_obs=next_obs.astype(jnp.float32)
     next_done = jnp.zeros(args.num_envs, dtype=jax.numpy.bool_)
     next_truncated = jnp.zeros(args.num_envs, dtype=jax.numpy.bool_)
     # based on https://github.dev/google/evojax/blob/0625d875262011d8e1b6aa32566b236f44b4da66/evojax/sim_mgr.py
     def step_once(carry, step, env_step_fn):
-        agent_state, episode_stats, obs, done, truncated, key, handle,obs_rms = carry
+        agent_state, episode_stats, obs, done, truncated, key, handle = carry
         action, logprob, value, key = get_action_and_value(
             agent_state, obs, key)
-        episode_stats, handle, obs_rms, (next_obs, reward, next_done, next_truncated, _) = env_step_fn(
-            episode_stats, handle, obs_rms, action.astype(jnp.float64))
+        episode_stats, handle, (next_obs, reward, next_done, next_truncated, _) = env_step_fn(
+            episode_stats, handle, action.astype(jnp.float64))
         next_obs=next_obs.astype(jnp.float32)
         reward.astype(jnp.float32)
         storage = Storage(
@@ -419,21 +413,21 @@ if __name__ == "__main__":
             returns=jnp.zeros_like(reward),
             advantages=jnp.zeros_like(reward),
         )
-        return ((agent_state, episode_stats, next_obs, next_done, next_truncated, key, handle , obs_rms), storage)
+        return ((agent_state, episode_stats, next_obs, next_done, next_truncated, key, handle ), storage)
 
-    def rollout(agent_state, episode_stats, next_obs, next_done, next_truncated, key, handle, obs_rms, step_once_fn, max_steps):
-        (agent_state, episode_stats, next_obs, next_done, next_truncated, key, handle,obs_rms), storage = jax.lax.scan(
+    def rollout(agent_state, episode_stats, next_obs, next_done, next_truncated, key, handle, step_once_fn, max_steps):
+        (agent_state, episode_stats, next_obs, next_done, next_truncated, key, handle), storage = jax.lax.scan(
             step_once_fn, (agent_state, episode_stats, next_obs,
-                           next_done, next_truncated, key, handle,obs_rms), (), max_steps
+                           next_done, next_truncated, key, handle), (), max_steps
         )
-        return agent_state, episode_stats, next_obs, next_done, next_truncated, storage, key, handle , obs_rms
+        return agent_state, episode_stats, next_obs, next_done, next_truncated, storage, key, handle 
 
     rollout = partial(rollout, step_once_fn=partial(
         step_once, env_step_fn=step_env_wrappeed), max_steps=args.num_steps)
     for update in range(1, args.num_updates + 1):
         update_time_start = time.time()
-        agent_state, episode_stats, next_obs, next_done,next_truncated, storage, key, handle ,obs_rms = rollout(
-            agent_state, episode_stats, next_obs, next_done, next_truncated, key, handle,obs_rms
+        agent_state, episode_stats, next_obs, next_done,next_truncated, storage, key, handle  = rollout(
+            agent_state, episode_stats, next_obs, next_done, next_truncated, key, handle
         )
         global_step += args.num_steps * args.num_envs
         agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
