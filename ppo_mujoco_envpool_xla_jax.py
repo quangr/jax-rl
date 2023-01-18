@@ -454,6 +454,6 @@ if __name__ == "__main__":
             wandb.log({"global_step": global_step, "avg_episodic_return": avg_episodic_return, "v_loss": v_loss.mean(
             ), "pg_loss": pg_loss.mean(), "approx_kl": approx_kl.mean(), "entropy_loss": entropy_loss.mean()})
         print(
-            f"global_step={global_step}, avg_episodic_length={avg_episodic_length}, avg_episodic_return={avg_episodic_return}, SPS={int(global_step / (time.time() - start_time))}")
+            f"global_step={global_step}, avg_episodic_length={avg_episodic_length}, avg_episodic_return={avg_episodic_return}, SPS={int(args.num_steps * args.num_envs / (time.time() - update_time_start))}")
 
     envs.close()
