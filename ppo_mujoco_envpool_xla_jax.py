@@ -45,7 +45,7 @@ def parse_args():
         help="the entity (team) of wandb's project")
     parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to capture videos of the agent performances (check out `videos` folder)")
-
+    parser.add_argument("--rew-norm", type=int, default=False)
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="HalfCheetah-v3",
         help="the id of the environment")
@@ -118,12 +118,12 @@ class Actor(nn.Module):
                             jnp.ones(shape)/2, (self.action_dim,))
         return x, stdlog
 
-
+class PPOTrainState(TrainState):
+    ret_rms:RunningMeanStd
 @flax.struct.dataclass
 class AgentParams:
     actor_params: flax.core.FrozenDict
     critic_params: flax.core.FrozenDict
-
 
 @flax.struct.dataclass
 class Storage:
@@ -221,7 +221,7 @@ if __name__ == "__main__":
         action_dim=np.prod(single_action_space.shape),
     )
     critic = Critic()
-    agent_state = TrainState.create(
+    agent_state = PPOTrainState.create(
         apply_fn=None,
         params=AgentParams(
             actor.init(actor_key, np.array(
@@ -235,6 +235,7 @@ if __name__ == "__main__":
                 learning_rate=linear_schedule if args.anneal_lr else args.learning_rate
             ),
         ),
+        ret_rms=RunningMeanStd()
     )
     actor.apply = jax.jit(actor.apply)
     critic.apply = jax.jit(critic.apply)
@@ -298,7 +299,8 @@ if __name__ == "__main__":
             agent_state.params.critic_params, jnp.concatenate(
                 [storage.obs, next_obs[None, :]], axis=0)
         ).squeeze()
-
+        if args.rew_norm:
+            values=values*jnp.sqrt(agent_state.ret_rms.var).astype(jnp.float32)
         advantages = jnp.zeros((args.num_envs,))
         dones = jnp.concatenate([storage.dones, next_done[None, :]], axis=0)
         truncated = jnp.concatenate([storage.truncated, next_truncated[None, :]], axis=0)
@@ -306,11 +308,16 @@ if __name__ == "__main__":
             compute_gae_once, advantages, (dones[1:],truncated[1:], values[1:]*(1.0-dones[1:]),
                                            values[:-1], storage.rewards), reverse=True
         )
+        returns=advantages + values[:-1]
+        if args.rew_norm:
+            returns = (returns / jnp.sqrt(agent_state.ret_rms.var + 10e-8)).astype(jnp.float32)
+            agent_state=agent_state.replace(ret_rms=agent_state.ret_rms.update(returns.flatten()))
+
         storage = storage.replace(
             advantages=advantages,
-            returns=advantages + values[:-1],
+            returns=returns,
         )
-        return storage
+        return storage,agent_state
 
     def ppo_loss(params, x, a, logp, mb_advantages, mb_returns,truncated):
         newlogprob, entropy, newvalue = get_action_and_value2(params, x, a)
@@ -358,7 +365,7 @@ if __name__ == "__main__":
                 x = jax.random.permutation(subkey, x)
                 x = jnp.reshape(x, (args.num_minibatches, -1) + x.shape[1:])
                 return x
-            newstorage = compute_gae(agent_state, next_obs, next_done, next_truncated, storage)
+            newstorage,agent_state = compute_gae(agent_state, next_obs, next_done, next_truncated, storage)
             flatten_storage = jax.tree_map(
                 flatten, newstorage)  # seem uneffcient
             shuffled_storage = jax.tree_map(convert_data, flatten_storage)
