@@ -10,11 +10,13 @@ In this implementation.
 
 - write env wrapper in jax way.(the api is also different from traditional step and reset, the jax version wrapper should implement reset,send,recv)
 
-- run 8x~20x faster than tianshou
+- run 5x~10x faster than tianshou(depends on environment and your gpu, good gpu and long step environment(e.g. HalfCheetah) will lead to higher speedup)
 
-|  Mujoco SPS (global_step per second) | tianshou | jax version | Speedup |
+|  Mujoco(Ant-v3) SPS (global_step per second) | tianshou | jax version | Speedup |
 | :-------------: | :---------: | :--------------:|  :--------------:|
-|       64 cores Xeon + A100       |   1270    |       19190     | 15.1x |
+|       64 cores Xeon + A100       |   1243    |       13870     | 11.16x |
+|       128 cores AMD 3995WX + 2080ti       |   1360    |       6787     | 4.99x |
+|       32 cores AMD 3950X + 4090        |  1770  | 11568 | 6.535 |
 
 # Quick Start
 
