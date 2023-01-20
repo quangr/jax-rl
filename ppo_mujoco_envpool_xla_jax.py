@@ -45,9 +45,9 @@ def parse_args():
         help="the entity (team) of wandb's project")
     parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to capture videos of the agent performances (check out `videos` folder)")
-    parser.add_argument("--rew-norm", type=int, default=False)
     # Algorithm specific arguments
-    parser.add_argument("--env-id", type=str, default="HalfCheetah-v3",
+    parser.add_argument("--rew-norm", type=int, default=True)
+    parser.add_argument("--env-id", type=str, default="Ant-v3",
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=3000000,
         help="total timesteps of the experiments")
