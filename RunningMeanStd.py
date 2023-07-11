@@ -1,16 +1,15 @@
 import jax.numpy as jnp
-import jax
 import flax
 from jax.config import config
 config.update("jax_enable_x64", True)
 
 
 class RunningMeanStd(flax.struct.PyTreeNode):
-    eps: jnp.array =jnp.array(jnp.finfo(jnp.float64).eps.item(),dtype=jnp.float64)
+    eps: jnp.array =jnp.array(jnp.finfo(jnp.float32).eps.item(),dtype=jnp.float32)
     mean: jnp.array =0.0
     var: jnp.array =1.0
-    clip_max: jnp.array =jnp.array(10.0,dtype=jnp.float64)
-    count: jnp.array =jnp.array(0,dtype=jnp.int64)
+    clip_max: jnp.array =jnp.array(10.0,dtype=jnp.float32)
+    count: jnp.array =jnp.array(0,dtype=jnp.int32)
 
     def norm(self, data_array):
         data_array = (data_array - self.mean) / jnp.sqrt(self.var + self.eps)

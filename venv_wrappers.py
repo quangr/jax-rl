@@ -1,5 +1,3 @@
-from abc import ABCMeta, abstractmethod
-from types import FunctionType
 import envpool
 
 import flax
@@ -75,7 +73,10 @@ class VectorEnvNormObs(EnvWrapper):
         return self.replace(obs_rms=obs_rms), (obs,info)
 
 
-
+@flax.struct.dataclass
+class MojocoEnvDtypeAct(EnvWrapper):
+    def send(self,action):
+        return action.astype(jnp.float64)
 
 @flax.struct.dataclass
 class VectorEnvClipAct(EnvWrapper):
@@ -83,7 +84,7 @@ class VectorEnvClipAct(EnvWrapper):
     action_high:jnp.array
     def send(self,action):
         action_remap=jnp.clip(action, -1.0, 1.0)
-        action_remap=(self.action_low+(action_remap+1.0)*(self.action_high-self.action_low)/2.0).astype(jnp.float64)
+        action_remap=(self.action_low+(action_remap+1.0)*(self.action_high-self.action_low)/2.0)
         return action
 
 if __name__ == "__main__":

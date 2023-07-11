@@ -1,32 +1,36 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_atari_envpool_xla_jaxpy
-import os
-
-from RunningMeanStd import RunningMeanStd
-from venv_wrappers import VectorEnvClipAct, VectorEnvNormObs, VectorEnvWrapper
-
-os.environ["JAX_DEFAULT_DTYPE_BITS"] = "32"
-from flax.training.train_state import TrainState
-from flax.linen.initializers import constant, orthogonal
-import optax
-import numpy as np
-import jax.numpy as jnp
-import jax
-import flax.linen as nn
-import flax
-from collections import namedtuple
-import envpool
 import argparse
 import os
 import random
 import time
+from collections import namedtuple
 from distutils.util import strtobool
 from functools import partial
 from typing import Sequence
-from jax.config import config
 
-config.update("jax_enable_x64", False)
+import envpool
+import envpool.mujoco.gym.registration
+import flax
+import flax.linen as nn
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+from flax.linen.initializers import constant, orthogonal
+from flax.training.train_state import TrainState
+from jax.config import config
+from Lagrange import Lagrange
+
+from RunningMeanStd import RunningMeanStd
+from venv_wrappers import (
+    MojocoEnvDtypeAct,
+    VectorEnvClipAct,
+    VectorEnvNormObs,
+    VectorEnvWrapper,
+)
+
 # config.update("jax_default_matmul_precision", jax.lax.Precision.HIGHEST)
-# config.update('jax_disable_jit', True)
+config.update("jax_disable_jit", True)
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -50,7 +54,7 @@ def parse_args():
         help="whether to capture videos of the agent performances (check out `videos` folder)")
     # Algorithm specific arguments
     parser.add_argument("--rew-norm", type=int, default=True)
-    parser.add_argument("--env-id", type=str, default="Ant-v3",
+    parser.add_argument("--env-id", type=str, default="InvertedPendulum-v2",
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=3000000,
         help="total timesteps of the experiments")
@@ -149,12 +153,23 @@ class Actor(nn.Module):
 
 class PPOTrainState(TrainState):
     ret_rms: RunningMeanStd
+    cost_ret_rms: RunningMeanStd
+    lagrange: Lagrange
 
 
 @flax.struct.dataclass
 class AgentParams:
     actor_params: flax.core.FrozenDict
     critic_params: flax.core.FrozenDict
+    cost_critic_params: flax.core.FrozenDict
+
+
+@flax.struct.dataclass
+class RewardMetrics:
+    values: jnp.array
+    advantages: jnp.array
+    returns: jnp.array
+    rewards: jnp.array
 
 
 @flax.struct.dataclass
@@ -164,16 +179,16 @@ class Storage:
     logprobs: jnp.array
     dones: jnp.array
     truncated: jnp.array
-    values: jnp.array
-    advantages: jnp.array
-    returns: jnp.array
-    rewards: jnp.array
+    reward: RewardMetrics
+    cost: RewardMetrics
 
 
 @flax.struct.dataclass
 class EpisodeStatistics:
+    episode_costs: jnp.array
     episode_returns: jnp.array
     episode_lengths: jnp.array
+    returned_episode_costs: jnp.array
     returned_episode_returns: jnp.array
     returned_episode_lengths: jnp.array
 
@@ -212,8 +227,10 @@ if __name__ == "__main__":
     single_observation_space = envs.observation_space
     envs.is_vector_env = True
     episode_stats = EpisodeStatistics(
+        episode_costs=jnp.zeros(args.num_envs, dtype=jnp.float32),
         episode_returns=jnp.zeros(args.num_envs, dtype=jnp.float32),
         episode_lengths=jnp.zeros(args.num_envs, dtype=jnp.int32),
+        returned_episode_costs=jnp.zeros(args.num_envs, dtype=jnp.float32),
         returned_episode_returns=jnp.zeros(args.num_envs, dtype=jnp.float32),
         returned_episode_lengths=jnp.zeros(args.num_envs, dtype=jnp.int32),
     )
@@ -221,17 +238,29 @@ if __name__ == "__main__":
         VectorEnvNormObs(),
         VectorEnvClipAct(envs.action_space.low, envs.action_space.high),
     ]
+    if envs.action_space.dtype == np.float64:
+        config.update("jax_enable_x64", True)
+        wrappers + [MojocoEnvDtypeAct()]
+
     envs = VectorEnvWrapper(envs, wrappers)
 
     handle, recv, send, step_env = envs.xla()
+
+    def get_cost(next_obs, reward, next_done, next_truncated, info):
+        return info["qpos0"][:, 0] > -0.01
 
     def step_env_wrappeed(episode_stats, handle, action):
         handle, (next_obs, reward, next_done, next_truncated, info) = step_env(
             handle, action
         )
+        cost = get_cost(next_obs, reward, next_done, next_truncated, info).astype(
+            jnp.float32
+        )
+        new_episode_cost = episode_stats.episode_costs + cost
         new_episode_return = episode_stats.episode_returns + reward
         new_episode_length = episode_stats.episode_lengths + 1
         episode_stats = episode_stats.replace(
+            episode_costs=(new_episode_cost) * (1 - next_done) * (1 - next_truncated),
             episode_returns=(new_episode_return)
             * (1 - next_done)
             * (1 - next_truncated),
@@ -239,6 +268,11 @@ if __name__ == "__main__":
             * (1 - next_done)
             * (1 - next_truncated),
             # only update the `returned_episode_returns` if the episode is done
+            returned_episode_costs=jnp.where(
+                next_done + next_truncated,
+                new_episode_cost,
+                episode_stats.returned_episode_costs,
+            ),
             returned_episode_returns=jnp.where(
                 next_done + next_truncated,
                 new_episode_return,
@@ -253,7 +287,7 @@ if __name__ == "__main__":
         return (
             episode_stats,
             handle,
-            (next_obs, reward, next_done, next_truncated, info),
+            (next_obs, reward, cost, next_done, next_truncated, info),
         )
 
     def linear_schedule(count):
@@ -269,6 +303,7 @@ if __name__ == "__main__":
         action_dim=np.prod(single_action_space.shape),
     )
     critic = Critic()
+    cost_critic = Critic()
     agent_state = PPOTrainState.create(
         apply_fn=None,
         params=AgentParams(
@@ -280,6 +315,10 @@ if __name__ == "__main__":
                 critic_key,
                 np.array([single_observation_space.sample()], dtype=jnp.float32),
             ),
+            cost_critic.init(
+                critic_key,
+                np.array([single_observation_space.sample()], dtype=jnp.float32),
+            ),
         ),
         tx=optax.chain(
             optax.clip_by_global_norm(args.max_grad_norm),
@@ -288,6 +327,8 @@ if __name__ == "__main__":
             ),
         ),
         ret_rms=RunningMeanStd(),
+        cost_ret_rms=RunningMeanStd(),
+        lagrange=Lagrange.create(0.0, 0.035, 0.0, 0.01),
     )
     actor.apply = jax.jit(actor.apply)
     critic.apply = jax.jit(critic.apply)
@@ -312,7 +353,8 @@ if __name__ == "__main__":
             -1
         )  # need gradient information
         value = critic.apply(agent_state.params.critic_params, next_obs)
-        return action, logprob, value.squeeze(1), key
+        cost_value = critic.apply(agent_state.params.cost_critic_params, next_obs)
+        return action, logprob, value.squeeze(1), cost_value.squeeze(1), key
 
     @jax.jit
     def get_action_and_value2(
@@ -331,11 +373,10 @@ if __name__ == "__main__":
             -1
         )  # need gradient information
         # normalize the logits https://gregorygundersen.com/blog/2020/02/09/log-sum-exp/
-        # logits = logits - jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)
-        # logits = logits.clip(min=jnp.finfo(logits.dtype).min)
         entropy = (2 * stdlog + jnp.log(2 * jnp.pi) + 1) / 2
         value = critic.apply(params.critic_params, x).squeeze()
-        return logprob, entropy.sum(-1), value
+        cost_value = cost_critic.apply(params.cost_critic_params, x).squeeze()
+        return logprob, entropy.sum(-1), value, cost_value
 
     def compute_gae_once(carry, inp, gamma, gae_lambda):
         advantages = carry
@@ -350,20 +391,15 @@ if __name__ == "__main__":
         compute_gae_once, gamma=args.gamma, gae_lambda=args.gae_lambda
     )
 
-    @jax.jit
-    def compute_gae(
-        agent_state: TrainState,
-        next_obs: np.ndarray,
-        next_done: np.ndarray,
-        next_truncated: np.ndarray,
-        storage: Storage,
+    def compute_advantages_and_returns(
+        critic_params, ret_rms, next_obs, next_done, next_truncated, storage, rewards
     ):
         values = critic.apply(
-            agent_state.params.critic_params,
+            critic_params,
             jnp.concatenate([storage.obs, next_obs[None, :]], axis=0),
         ).squeeze()
         if args.rew_norm:
-            values = values * jnp.sqrt(agent_state.ret_rms.var).astype(jnp.float32)
+            values = values * jnp.sqrt(ret_rms.var).astype(jnp.float32)
         advantages = jnp.zeros((args.num_envs,))
         dones = jnp.concatenate([storage.dones, next_done[None, :]], axis=0)
         truncated = jnp.concatenate(
@@ -377,27 +413,72 @@ if __name__ == "__main__":
                 truncated[1:],
                 values[1:] * (1.0 - dones[1:]),
                 values[:-1],
-                storage.rewards,
+                rewards,
             ),
             reverse=True,
         )
         returns = advantages + values[:-1]
+        return advantages, returns
+
+    @jax.jit
+    def compute_gae(
+        agent_state: TrainState,
+        next_obs: np.ndarray,
+        next_done: np.ndarray,
+        next_truncated: np.ndarray,
+        storage: Storage,
+    ):
+        advantages, returns = compute_advantages_and_returns(
+            agent_state.params.critic_params,
+            agent_state.ret_rms,
+            next_obs,
+            next_done,
+            next_truncated,
+            storage,
+            storage.reward.rewards,
+        )
+        cost_advantages, cost_returns = compute_advantages_and_returns(
+            agent_state.params.cost_critic_params,
+            agent_state.cost_ret_rms,
+            next_obs,
+            next_done,
+            next_truncated,
+            storage,
+            storage.cost.rewards,
+        )
         if args.rew_norm:
             returns = (returns / jnp.sqrt(agent_state.ret_rms.var + 10e-8)).astype(
                 jnp.float32
             )
+            cost_returns = (
+                cost_returns / jnp.sqrt(agent_state.cost_ret_rms.var + 10e-8)
+            ).astype(jnp.float32)
             agent_state = agent_state.replace(
-                ret_rms=agent_state.ret_rms.update(returns.flatten())
+                ret_rms=agent_state.ret_rms.update(returns.flatten()),
+                cost_ret_rms=agent_state.cost_ret_rms.update(cost_returns.flatten()),
             )
 
         storage = storage.replace(
-            advantages=advantages,
-            returns=returns,
+            reward=storage.reward.replace(
+                advantages=advantages,
+                returns=returns,
+            ),
+            cost=storage.cost.replace(
+                advantages=cost_advantages,
+                returns=cost_returns,
+            ),
         )
         return storage, agent_state
 
-    def ppo_loss(params, x, a, logp, mb_advantages, mb_returns, truncated):
-        newlogprob, entropy, newvalue = get_action_and_value2(params, x, a)
+    def ppo_loss(params, x, a, logp, reward, cost, truncated, penalty):
+        # (adv_r - penalty * adv_c) / (1 + penalty)
+        mb_advantages = (reward.advantages - cost.advantages * penalty) / (1 + penalty)
+        # mb_advantages = reward.advantages
+        mb_returns = reward.returns
+        mb_costreturns = cost.returns
+        newlogprob, entropy, newvalue, newcostvalue = get_action_and_value2(
+            params, x, a
+        )
         logratio = newlogprob - logp
         ratio = jnp.exp(logratio)
         approx_kl = ((ratio - 1) - logratio).mean()
@@ -420,10 +501,19 @@ if __name__ == "__main__":
         v_loss = (((newvalue - mb_returns) * (1 - truncated)) ** 2).sum() / (
             1 - truncated
         ).sum()
+        cost_v_loss = (
+            ((newcostvalue - mb_costreturns) * (1 - truncated)) ** 2
+        ).sum() / (1 - truncated).sum()
 
         entropy_loss = entropy.mean()
-        loss = pg_loss + v_loss * args.vf_coef
-        return loss, (pg_loss, v_loss, entropy_loss, jax.lax.stop_gradient(approx_kl))
+        loss = pg_loss + (v_loss + cost_v_loss) * args.vf_coef
+        return loss, (
+            pg_loss,
+            v_loss,
+            cost_v_loss,
+            entropy_loss,
+            jax.lax.stop_gradient(approx_kl),
+        )
 
     ppo_loss_grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
 
@@ -437,6 +527,7 @@ if __name__ == "__main__":
         next_done: np.ndarray = rollout_state.next_done
         next_truncated: np.ndarray = rollout_state.next_truncated
         key: jax.random.PRNGKey = rollout_state.key
+        penalty = agent_state.lagrange.state.params
 
         def update_epoch(carry, unused_inp):
             agent_state, key = carry
@@ -460,21 +551,23 @@ if __name__ == "__main__":
             def update_minibatch(agent_state, minibatch):
                 (
                     loss,
-                    (pg_loss, v_loss, entropy_loss, approx_kl),
+                    (pg_loss, v_loss, cost_v_loss, entropy_loss, approx_kl),
                 ), grads = ppo_loss_grad_fn(
                     agent_state.params,
                     minibatch.obs,
                     minibatch.actions,
                     minibatch.logprobs,
-                    minibatch.advantages,
-                    minibatch.returns,
+                    minibatch.reward,
+                    minibatch.cost,
                     minibatch.truncated,
+                    penalty,
                 )
                 agent_state = agent_state.apply_gradients(grads=grads)
                 return agent_state, (
                     loss,
                     pg_loss,
                     v_loss,
+                    cost_v_loss,
                     entropy_loss,
                     approx_kl,
                     grads,
@@ -484,6 +577,7 @@ if __name__ == "__main__":
                 loss,
                 pg_loss,
                 v_loss,
+                cost_v_loss,
                 entropy_loss,
                 approx_kl,
                 grads,
@@ -492,6 +586,7 @@ if __name__ == "__main__":
                 loss,
                 pg_loss,
                 v_loss,
+                cost_v_loss,
                 entropy_loss,
                 approx_kl,
                 grads,
@@ -501,6 +596,7 @@ if __name__ == "__main__":
             loss,
             pg_loss,
             v_loss,
+            cost_v_loss,
             entropy_loss,
             approx_kl,
             grads,
@@ -512,6 +608,7 @@ if __name__ == "__main__":
             loss,
             pg_loss,
             v_loss,
+            cost_v_loss,
             entropy_loss,
             approx_kl,
         )
@@ -526,11 +623,13 @@ if __name__ == "__main__":
     # based on https://github.dev/google/evojax/blob/0625d875262011d8e1b6aa32566b236f44b4da66/evojax/sim_mgr.py
     def step_once(carry, step, env_step_fn):
         agent_state, episode_stats, obs, done, truncated, key, handle = carry
-        action, logprob, value, key = get_action_and_value(agent_state, obs, key)
+        action, logprob, value, cost_value, key = get_action_and_value(
+            agent_state, obs, key
+        )
         (
             episode_stats,
             handle,
-            (next_obs, reward, next_done, next_truncated, _),
+            (next_obs, reward, cost, next_done, next_truncated, _),
         ) = env_step_fn(episode_stats, handle, action)
         next_obs = next_obs.astype(jnp.float32)
         reward.astype(jnp.float32)
@@ -540,10 +639,18 @@ if __name__ == "__main__":
             logprobs=logprob,
             dones=done,
             truncated=truncated,
-            values=value,
-            rewards=reward,
-            returns=jnp.zeros_like(reward),
-            advantages=jnp.zeros_like(reward),
+            reward=RewardMetrics(
+                values=value,
+                rewards=reward,
+                returns=jnp.zeros_like(reward),
+                advantages=jnp.zeros_like(reward),
+            ),
+            cost=RewardMetrics(
+                values=cost_value,
+                rewards=cost,
+                returns=jnp.zeros_like(reward),
+                advantages=jnp.zeros_like(reward),
+            ),
         )
         return (
             (
@@ -617,11 +724,23 @@ if __name__ == "__main__":
         update_time_start = time.time()
         rollout_state, storage = rollout(*rollout_state)
         global_step += args.num_steps * args.num_envs
-        rollout_state, loss, pg_loss, v_loss, entropy_loss, approx_kl = update_ppo(
-            rollout_state, storage
+        avg_episodic_cost = np.mean(
+            jax.device_get(rollout_state.episode_stats.returned_episode_costs)
         )
+        agent_state = agent_state.replace(
+            lagrange=agent_state.lagrange.update_lagrange_multiplier(avg_episodic_cost)
+        )
+        (
+            rollout_state,
+            loss,
+            pg_loss,
+            v_loss,
+            cost_v_loss,
+            entropy_loss,
+            approx_kl,
+        ) = update_ppo(rollout_state, storage)
         print(
-            f"pg_loss={pg_loss.mean()}, loss={loss.mean()}, v_loss={v_loss.mean()}, entropy_loss={entropy_loss.mean()}"
+            f"pg_loss={pg_loss.mean()}, loss={loss.mean()}, v_loss={v_loss.mean()}, cost_v_loss={cost_v_loss.mean()}, entropy_loss={entropy_loss.mean()}"
         )
         avg_episodic_return = np.mean(
             jax.device_get(rollout_state.episode_stats.returned_episode_returns)
@@ -641,7 +760,7 @@ if __name__ == "__main__":
                 }
             )
         print(
-            f"global_step={global_step}, avg_episodic_length={avg_episodic_length}, avg_episodic_return={avg_episodic_return}, SPS={int(args.num_steps * args.num_envs / (time.time() - update_time_start))}"
+            f"global_step={global_step}, avg_episodic_length={avg_episodic_length}, avg_episodic_return={avg_episodic_return}, avg_episodic_cost={avg_episodic_cost}, lagrange={agent_state.lagrange.state.params}, SPS={int(args.num_steps * args.num_envs / (time.time() - update_time_start))}"
         )
 
     envs.close()
