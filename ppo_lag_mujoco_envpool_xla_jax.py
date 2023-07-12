@@ -8,6 +8,7 @@ from distutils.util import strtobool
 from functools import partial
 from typing import Sequence
 
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
 import envpool
 import envpool.mujoco.gym.registration
 import flax
@@ -20,6 +21,8 @@ from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
 from jax.config import config
 from Lagrange import Lagrange
+import orbax.checkpoint
+from flax.training import orbax_utils
 
 from RunningMeanStd import RunningMeanStd
 from venv_wrappers import (
@@ -30,7 +33,7 @@ from venv_wrappers import (
 )
 
 # config.update("jax_default_matmul_precision", jax.lax.Precision.HIGHEST)
-config.update("jax_disable_jit", True)
+# config.update("jax_disable_jit", True)
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -48,17 +51,17 @@ def parse_args():
         help="if toggled, this experiment will be tracked with Weights and Biases")
     parser.add_argument("--wandb-project-name", type=str, default="cleanRL",
         help="the wandb's project name")
-    parser.add_argument("--wandb-entity", type=str, default=None,
+    parser.add_argument("--wandb-entity", type=str, default="quangr ",
         help="the entity (team) of wandb's project")
     parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to capture videos of the agent performances (check out `videos` folder)")
     # Algorithm specific arguments
-    parser.add_argument("--rew-norm", type=int, default=True)
-    parser.add_argument("--env-id", type=str, default="InvertedPendulum-v2",
+    parser.add_argument("--rew-norm", type=int, default=False)
+    parser.add_argument("--env-id", type=str, default="Ant-v4",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=3000000,
+    parser.add_argument("--total-timesteps", type=int, default=10000000,
         help="total timesteps of the experiments")
-    parser.add_argument("--learning-rate", type=float, default=3e-4,
+    parser.add_argument("--learning-rate", type=float, default=1e-4,
         help="the learning rate of the optimizer")
     parser.add_argument("--num-envs", type=int, default=64,
         help="the number of parallel game environments")
@@ -247,7 +250,10 @@ if __name__ == "__main__":
     handle, recv, send, step_env = envs.xla()
 
     def get_cost(next_obs, reward, next_done, next_truncated, info):
-        return info["qpos0"][:, 0] > -0.01
+        # return info["x_position"] <=-3
+        return info["y_position"] > -2
+        # return (info["y_position"] > -2)
+        # return (info["y_position"] > 0) | (info["y_position"] < -3)
 
     def step_env_wrappeed(episode_stats, handle, action):
         handle, (next_obs, reward, next_done, next_truncated, info) = step_env(
@@ -328,7 +334,7 @@ if __name__ == "__main__":
         ),
         ret_rms=RunningMeanStd(),
         cost_ret_rms=RunningMeanStd(),
-        lagrange=Lagrange.create(0.0, 0.035, 0.0, 0.01),
+        lagrange=Lagrange.create(100.0, 0.035, 0.0, 0.01),
     )
     actor.apply = jax.jit(actor.apply)
     critic.apply = jax.jit(critic.apply)
@@ -727,9 +733,25 @@ if __name__ == "__main__":
         avg_episodic_cost = np.mean(
             jax.device_get(rollout_state.episode_stats.returned_episode_costs)
         )
-        agent_state = agent_state.replace(
-            lagrange=agent_state.lagrange.update_lagrange_multiplier(avg_episodic_cost)
+        rollout_state = rollout_state._replace(
+            agent_state=rollout_state.agent_state.replace(
+                lagrange=rollout_state.agent_state.lagrange.update_lagrange_multiplier(
+                    avg_episodic_cost
+                )
+            )
         )
+        # if update>10:
+        #     with jax.disable_jit():
+        #         (
+        #             rollout_state,
+        #             loss,
+        #             pg_loss,
+        #             v_loss,
+        #             cost_v_loss,
+        #             entropy_loss,
+        #             approx_kl,
+        #         ) = update_ppo(rollout_state, storage)
+
         (
             rollout_state,
             loss,
@@ -753,14 +775,19 @@ if __name__ == "__main__":
                 {
                     "global_step": global_step,
                     "avg_episodic_return": avg_episodic_return,
+                    "avg_episodic_cost": avg_episodic_cost,
                     "v_loss": v_loss.mean(),
+                    "cost_v_loss": cost_v_loss.mean(),
                     "pg_loss": pg_loss.mean(),
                     "approx_kl": approx_kl.mean(),
                     "entropy_loss": entropy_loss.mean(),
                 }
             )
         print(
-            f"global_step={global_step}, avg_episodic_length={avg_episodic_length}, avg_episodic_return={avg_episodic_return}, avg_episodic_cost={avg_episodic_cost}, lagrange={agent_state.lagrange.state.params}, SPS={int(args.num_steps * args.num_envs / (time.time() - update_time_start))}"
+            f"global_step={global_step}, avg_episodic_length={avg_episodic_length}, avg_episodic_return={avg_episodic_return}, avg_episodic_cost={avg_episodic_cost}, lagrange={rollout_state.agent_state.lagrange.state.params}, SPS={int(args.num_steps * args.num_envs / (time.time() - update_time_start))}"
         )
-
-    envs.close()
+    ckpt = rollout_state
+    orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+    save_args = orbax_utils.save_args_from_target(ckpt)
+    orbax_checkpointer.save(f"tmp/{run_name}", ckpt, save_args=save_args)
+    # envs.close()
